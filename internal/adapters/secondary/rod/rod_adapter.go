@@ -4,70 +4,69 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"strings"
 	"sync"
 	"time"
 
-	"go-meeting-recorder/internal/core/domain"
-	"go-meeting-recorder/internal/core/ports"
-
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
-	"github.com/go-rod/stealth"
+
+	"go-meeting-recorder/internal/core/domain"
+	"go-meeting-recorder/internal/core/ports"
 )
 
-type rodAutomator struct {
+type RodAdapter struct {
 	browsers map[string]*rod.Browser
 	pages    map[string]*rod.Page
 	mu       sync.Mutex
+	stopCh   map[string]chan struct{} // Channel to signal stop to monitoring routine
 }
 
 func NewRodAutomator() ports.BrowserAutomator {
-	return &rodAutomator{
+	return &RodAdapter{
 		browsers: make(map[string]*rod.Browser),
 		pages:    make(map[string]*rod.Page),
+		stopCh:   make(map[string]chan struct{}),
 	}
 }
 
-func (r *rodAutomator) JoinMeeting(ctx context.Context, session *domain.MeetingSession) error {
-	// Find system Chrome - this is CRITICAL for Teams/Meet which block bundled Chromium
-	chromePath, found := launcher.LookPath()
-	if !found {
-		// Fallback to common Windows Chrome paths
-		chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-	}
-	fmt.Printf("[Rod] Using Chrome at: %s\n", chromePath)
+func (r *RodAdapter) JoinMeeting(ctx context.Context, session *domain.MeetingSession) error {
+	log.Println("Starting Rod automation for Teams...")
 
-	// Configure launcher with critical evasion flags using SYSTEM Chrome
 	l := launcher.New().
-		Bin(chromePath). // Use real Chrome, not bundled Chromium
-		Headless(false). // Debugging: Show browser window
+		Bin("/usr/bin/google-chrome").
+		UserDataDir("/tmp/rod-teams-profile").
+		Headless(true).
 		Set("no-sandbox").
+		Set("disable-gpu").
+		Set("disable-software-rasterizer").
+		Set("disable-features", "DialerProtocolHandler,ExternalProtocolDialog").
+		Set("disable-protocol-handler-registration").
 		Set("disable-setuid-sandbox").
-		Set("disable-blink-features", "AutomationControlled"). // Critical
+		Set("disable-blink-features", "AutomationControlled").
 		Set("use-fake-ui-for-media-stream").
 		Set("use-fake-device-for-media-stream").
 		Set("autoplay-policy", "no-user-gesture-required").
 		Set("disable-popup-blocking").
-		Set("disable-notifications")
+		Set("disable-notifications").
+		Set("disable-features", "DialerProtocolHandler,ExternalProtocolDialog").
+		Set("disable-protocol-handler-registration").
+		Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-	// r.logger.Info("Launching browser...")
 	u, err := l.Launch()
-
 	if err != nil {
 		return fmt.Errorf("failed to launch browser: %w", err)
 	}
 
-	// Create browser instance
 	browser := rod.New().ControlURL(u).MustConnect()
 
 	r.mu.Lock()
 	r.browsers[session.ID] = browser
+	r.stopCh[session.ID] = make(chan struct{})
 	r.mu.Unlock()
 
-	// 1. Grant Permissions (CRITICAL for Teams/Meet)
-	// We grant strict permissions to avoid prompts that block "Join" or cause "Unsupported" checks to fail
 	proto.BrowserGrantPermissions{
 		Origin: session.MeetingURL,
 		Permissions: []proto.BrowserPermissionType{
@@ -77,221 +76,269 @@ func (r *rodAutomator) JoinMeeting(ctx context.Context, session *domain.MeetingS
 		},
 	}.Call(browser)
 
-	// 2. Create Page with Stealth
-	// We use the stealth library, but we also inject aggressive overrides first
-	// to ensure properties like 'navigator.webdriver' are set to false immediately.
-	page := stealth.MustPage(browser)
+	page := browser.MustPage("")
 
 	page.MustEvalOnNewDocument(`
+		const winUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+		Object.defineProperty(navigator, 'userAgent', { get: () => winUA });
 		Object.defineProperty(navigator, 'webdriver', { get: () => false });
-		window.chrome = { runtime: {} };
+		Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+		Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
 		Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-		Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+		Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+		Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+		
+		window.chrome = { runtime: {} };
+		delete navigator.__proto__.webdriver;
 	`)
 
-	// 3. Set standard viewport
 	page.MustSetViewport(1920, 1080, 1, false)
+	page.SetExtraHeaders([]string{"Accept-Language", "en-US,en;q=0.9"})
 
-	// Handle dialogs
 	go page.HandleDialog()
 
 	r.mu.Lock()
 	r.pages[session.ID] = page
 	r.mu.Unlock()
 
-	// Navigate
-	// r.logger.Info("Navigating to meeting...")
-	page.MustNavigate(session.MeetingURL)
+	go page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) {
+		// Suppress verbose console logs if needed, or keep for debug
+	})()
 
-	// Wait specifically for either the "Open Teams?" dialog handling (browser level) or the page load
-	// We can't easily click "Cancel" on the system popup via DOM.
-	// However, usually clicking the "Continue on this browser" or "Use the web app" button works even if that popup is floating.
-	page.MustWaitLoad()
+	// URL Handling
+	finalURL := session.MeetingURL
+	if strings.Contains(finalURL, "teams.live.com/meet/") {
+		parts := strings.Split(finalURL, "teams.live.com/meet/")
+		if len(parts) > 1 {
+			remaining := parts[1]
+			meetingID := strings.Split(remaining, "?")[0]
+			pVal := ""
+			if strings.Contains(remaining, "p=") {
+				pParts := strings.Split(remaining, "p=")
+				if len(pParts) > 1 {
+					pVal = strings.Split(pParts[1], "&")[0]
+				}
+			}
+			finalURL = fmt.Sprintf("https://teams.live.com/_#/meet/%s?p=%s&anon=true", meetingID, pVal)
+			fmt.Printf("[Rod] Forced Deep Link URL: %s\n", finalURL)
+		}
+	}
 
-	// --- Join Logic ---
+	page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{
+		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		Platform:  "Windows",
+	})
+	
+	page.MustSetExtraHeaders("referer", "https://teams.live.com/", "sec-ch-ua-platform", "Windows")
+
+	fmt.Printf("[Rod] Navigating to: %s\n", finalURL)
+	_ = page.Navigate(finalURL)
+	time.Sleep(5 * time.Second)
+	
+	fmt.Println("[Rod] Initial navigation complete, handling join flow...")
 	fmt.Println("[Rod] Handling Teams join flow...")
-
-	// Polyfill for "Continue on this browser"
-	// We need to keep clicking "Continue on this browser" until we see the lobby (name input)
-	// or until we time out.
 
 	lobbyReached := false
 	startTime := time.Now()
 
-	for time.Since(startTime) < 30*time.Second {
-		// Check if we are already in lobby
-		if hasInput, _, _ := page.Has("input[data-tid='prejoin-display-name-input']"); hasInput {
-			fmt.Println("[Rod] Lobby detected (Name input found)")
+	for time.Since(startTime) < 45*time.Second {
+		page.MustScreenshot("debug_loop.png")
+
+		// 1. Dismiss "Continue without audio or video"
+		page.MustEval(`() => {
+			const btns = Array.from(document.querySelectorAll('button'));
+			const continueBtn = btns.find(b => b.innerText.includes('Continue without audio'));
+			if (continueBtn) continueBtn.click();
+		}`)
+
+	// 2. Mute Microphone (Refined)
+		page.MustEval(`() => {
+			const switches = Array.from(document.querySelectorAll('input[role="switch"]'));
+			switches.forEach(s => {
+				const ariaLabel = (s.getAttribute('aria-label') || "").toLowerCase();
+				// Check for "Mic" in label. State check: 'checked' property OR 'aria-checked' attribute
+				const isActive = s.checked || s.getAttribute('aria-checked') === 'true';
+				
+				if (ariaLabel.includes('mic') && isActive) {
+					console.log("Muting microphone (Refined)...");
+					s.click();
+				}
+
+				// Disable Camera
+				if ((ariaLabel.includes('camera') || ariaLabel.includes('video')) && isActive) {
+					console.log("Disabling camera...");
+					s.click();
+				}
+			});
+		}`)
+
+		// 3. Name Input & Join
+		status := page.MustEval(`(name) => {
+			const inputs = Array.from(document.querySelectorAll('input'));
+			const nameInput = inputs.find(i => 
+				i.getAttribute('data-tid') === 'prejoin-display-name-input' || 
+				(i.placeholder && i.placeholder.toLowerCase().includes('type your name'))
+			);
+			
+			if (!nameInput) return "input_not_found";
+			
+			// REACT HACK: Use native value setter
+			const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+			nativeInputValueSetter.call(nameInput, name);
+			
+			nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+			nameInput.dispatchEvent(new Event('change', { bubbles: true }));
+			nameInput.dispatchEvent(new Event('blur', { bubbles: true })); 
+			
+			const btns = Array.from(document.querySelectorAll('button'));
+			const joinBtn = btns.find(b => 
+				b.getAttribute('data-tid') === 'prejoin-join-button' ||
+				b.innerText === 'Join now' ||
+				b.getAttribute('aria-label') === 'Join now'
+			);
+			
+			if (joinBtn && !joinBtn.disabled) {
+				joinBtn.click();
+				return "joined";
+			}
+			
+			return "waiting_for_join_button";
+		}`, session.ParticipantName).Str()
+		
+		if status == "joined" {
 			lobbyReached = true
+			fmt.Println("[Rod] Successfully triggered join via JS!")
 			break
 		}
+		
+		time.Sleep(2 * time.Second)
+	}
 
-		fmt.Println("[Rod] Looking for entry buttons...")
-		page.MustScreenshot("debug_loop.png") // DEBUG: See what the bot sees
+	if lobbyReached {
+		fmt.Println("[Rod] Join action triggered. Establishing monitoring...")
+		
+		// Start Auto-Stop Monitor
+		go r.monitorMeetingStatus(ctx, session.ID, page)
+		
+		time.Sleep(10 * time.Second)
+		return nil
+	}
+	
+	return fmt.Errorf("failed to join meeting (JS could not complete flow) after 45 seconds")
+}
 
-		// Try to find and click any "Continue on browser" buttons
-		// We use Element variants that don't panic
-		if btn, err := page.Element("#container > div > div > div > div.mainActionsContent > div.actionsContainer > div > button"); err == nil {
-			fmt.Println("[Rod] Found main action button via CSS selector, clicking...")
-			btn.MustClick()
-		} else if btn, err := page.Element("button[data-tid='joinOnWeb']"); err == nil {
-			fmt.Println("[Rod] Found 'joinOnWeb' button, clicking...")
-			btn.MustClick()
-		} else if btn, err := page.ElementR("button", "Continue on this browser"); err == nil {
-			fmt.Println("[Rod] Found 'Continue on this browser' button, clicking...")
-			btn.MustClick()
-		} else if btn, err := page.ElementR("a", "Continue on this browser"); err == nil {
-			fmt.Println("[Rod] Found 'Continue on this browser' link, clicking...")
-			btn.MustClick()
-		} else if btn, err := page.ElementR("button", "Join on the web instead"); err == nil {
-			fmt.Println("[Rod] Found 'Join on the web instead' button, clicking...")
-			btn.MustClick()
+func (r *RodAdapter) monitorMeetingStatus(ctx context.Context, sessionID string, page *rod.Page) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Printf("[Rod] Monitoring session %s for exit conditions...\n", sessionID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.stopCh[sessionID]:
+			return
+		case <-ticker.C:
+			// Check for exit conditions (Broadened)
+			hasExited := false
+			err := rod.Try(func() {
+				hasExited = page.MustEval(`() => {
+					const bodyText = document.body.innerText;
+					return bodyText.includes("You have been removed") || 
+						   bodyText.includes("Someone removed you") ||
+						   bodyText.includes("Meeting ended") ||
+						   bodyText.includes("Call ended") ||
+						   bodyText.includes("Quality of this call") ||
+						   bodyText.includes("How was the quality");
+				}`).Bool()
+			})
+			
+			if err == nil && hasExited {
+				fmt.Printf("[Rod] Detected exit condition for session %s. Stopping...\n", sessionID)
+				r.StopMeeting(context.Background(), sessionID)
+				return
+			}
 		}
+	}
+}
 
-		time.Sleep(1 * time.Second)
+func (r *RodAdapter) StopMeeting(ctx context.Context, sessionID string) error {
+	log.Printf("StopMeeting called for session %s\n", sessionID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Signal monitor to stop
+	if ch, ok := r.stopCh[sessionID]; ok {
+		close(ch)
+		delete(r.stopCh, sessionID)
 	}
 
-	if !lobbyReached {
-		fmt.Println("[Rod] Failed to reach lobby after 30 seconds")
-		page.Screenshot(true, nil)
-		return fmt.Errorf("failed to reach lobby")
+	if browser, ok := r.browsers[sessionID]; ok {
+		// Close browser
+		err := browser.Close()
+		delete(r.browsers, sessionID)
+		delete(r.pages, sessionID)
+		return err
 	}
-
-	// 2. Wait for name input (Lobby)
-	// We know it exists or is about to exist because loop broke
-	nameInput := page.MustElement("input[data-tid='prejoin-display-name-input']")
-	nameInput.MustWaitVisible()
-
-	// Check if already filled (if SSO)
-	if val := nameInput.MustText(); val == "" {
-		nameInput.MustInput(session.ParticipantName)
-	}
-
-	// 3. Mute/Camera Off
-	// Rod KeyActions don't have SetShift/SetControl directly like that
-	// Use input.Key(keys...) or page.Keyboard
-	fmt.Println("[Rod] Muting and turning off camera...")
-	// Ctrl+Shift+M
-	page.Keyboard.Press(input.ControlLeft)
-	page.Keyboard.Press(input.ShiftLeft)
-	page.Keyboard.Press(input.KeyM)
-	page.Keyboard.Release(input.ShiftLeft)
-	page.Keyboard.Release(input.ControlLeft)
-
-	time.Sleep(500 * time.Millisecond)
-
-	// Ctrl+Shift+O
-	page.Keyboard.Press(input.ControlLeft)
-	page.Keyboard.Press(input.ShiftLeft)
-	page.Keyboard.Press(input.KeyO)
-	page.Keyboard.Release(input.ShiftLeft)
-	page.Keyboard.Release(input.ControlLeft)
-
-	// 4. Click Join Now
-	fmt.Println("[Rod] Looking for 'Join now' button...")
-
-	// Try multiple selectors for "Join" button
-	// data-tid='prejoin-join-button' is standard, but sometimes it's different
-	// We'll also try looking for the text "Join now"
-	joinBtnScanner := page.Race().
-		Element("button[data-tid='prejoin-join-button']").MustHandle(func(e *rod.Element) {
-		e.MustClick()
-	}).
-		ElementR("button", "Join now").MustHandle(func(e *rod.Element) {
-		e.MustClick()
-	})
-
-	if _, err := joinBtnScanner.Do(); err != nil {
-		// If both fail, take a screenshot
-		fmt.Printf("[Rod] Failed to find Join button: %v\n", err)
-		page.Screenshot(true, nil) // Save to disk as "screenshot.png"
-		return fmt.Errorf("failed to join meeting: %w", err)
-	}
-
-	fmt.Println("[Rod] Clicked 'Join now', waiting for meeting to stabilize...")
-
-	// Wait for meeting to stabilize
-	time.Sleep(5 * time.Second)
-
 	return nil
 }
 
-func (r *rodAutomator) GetMeetingStreams(ctx context.Context, sessionId string) (io.Reader, io.Reader, error) {
+func (r *RodAdapter) GetSnapshot(ctx context.Context, sessionID string) ([]byte, error) {
 	r.mu.Lock()
-	page, ok := r.pages[sessionId]
+	page, ok := r.pages[sessionID]
 	r.mu.Unlock()
 
 	if !ok {
-		return nil, nil, fmt.Errorf("page not found")
+		return nil, fmt.Errorf("page not found for session %s", sessionID)
+	}
+	return page.Screenshot(true, nil)
+}
+
+func (r *RodAdapter) GetMeetingStreams(ctx context.Context, sessionID string) (io.Reader, io.Reader, error) {
+	r.mu.Lock()
+	page, ok := r.pages[sessionID]
+	r.mu.Unlock()
+
+	if !ok {
+		return nil, nil, fmt.Errorf("page not found for session %s", sessionID)
 	}
 
-	// In a real implementation with rod-stream, we would do:
-	// extension := rodstream.NewExtension(...)
-	// client := extension.MustCreateStream(page).
-	//                 Audio(true).
-	//                 Video(true, 1920, 1080)
-	//
-	// However, since we cannot easily 'go get' blindly without verifying the exact version API
-	// and 'rod-stream' behavior in headless (requires extension loaded at launch),
-	// I will mock the interface compliance here to allow compilation while preserving the structure.
-	//
-	// To make this work IRL:
-	// 1. You must load the extension in NewRodAutomator launch options.
-	// 2. You call MustCreateStream here.
+	// Create pipe for video stream
+	pr, pw := io.Pipe()
 
-	// Simulating streams for now so code compiles and structure is ready
-	// Real implementation requires: "github.com/navicstein/rod-stream"
-
-	// Create pipes to simulate streams
-	videoReader, videoWriter := io.Pipe()
-	audioReader, audioWriter := io.Pipe()
-
-	// Start a background routine that mocks data (or takes screenshots for video)
+	// Start a goroutine to capture screenshots and write to pipe
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		defer pw.Close()
+		
+		// 5 FPS = 200ms interval
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
-		defer videoWriter.Close()
-		defer audioWriter.Close()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-r.stopCh[sessionID]:
+				return
 			case <-ticker.C:
-				// Continue taking screenshots for video stream simulation
-				img, err := page.Screenshot(false, nil)
-				if err == nil {
-					videoWriter.Write(img)
+				// Capture Screenshot
+				// Note: Use Screenshot(true, nil) for PNG
+				buf, err := page.Screenshot(true, nil)
+				if err != nil {
+					log.Printf("[RodStream] Error capturing screenshot: %v", err)
+					return // Exit stream on error (browser probably closed)
 				}
-				// Mock audio data (silence)
-				audioWriter.Write(make([]byte, 1024))
+				
+				// Write to pipe
+				if _, err := pw.Write(buf); err != nil {
+					log.Printf("[RodStream] Error writing to pipe: %v", err)
+					return
+				}
 			}
 		}
 	}()
 
-	return videoReader, audioReader, nil
-}
-
-func (r *rodAutomator) StopMeeting(ctx context.Context, sessionId string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if browser, ok := r.browsers[sessionId]; ok {
-		browser.MustClose()
-		delete(r.browsers, sessionId)
-		delete(r.pages, sessionId)
-	}
-	return nil
-}
-
-func (r *rodAutomator) GetSnapshot(ctx context.Context, sessionId string) ([]byte, error) {
-	r.mu.Lock()
-	page, ok := r.pages[sessionId]
-	r.mu.Unlock()
-
-	if !ok {
-		return nil, fmt.Errorf("session page not found")
-	}
-
-	return page.MustScreenshot(), nil
+	// Return Video Stream (pr), Audio Stream (nil for now)
+	return pr, nil, nil
 }

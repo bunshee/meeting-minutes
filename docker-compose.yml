@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  recorder:
+    build: .
+    container_name: meeting-recorder
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./recordings:/home/recorder/app/recordings
+    # shm_size is critical for Chrome to run reliably
+    shm_size: 2gb
+    # Security options might be needed for Chrome sandbox or PulseAudio
+    security_opt:
+      - seccomp:unconfined
+    # environment:
+    #   - PULSE_SERVER=unix:/tmp/pulse.sock
+    # We might not strictly need cap_add for pure headless, but SYS_ADMIN is often needed for sandbox
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped

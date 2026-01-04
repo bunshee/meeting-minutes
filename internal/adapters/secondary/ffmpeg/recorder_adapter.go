@@ -16,6 +16,7 @@ import (
 type ffmpegRecorder struct {
 	recordingDir string
 	cmds         map[string]*exec.Cmd
+	audioCmds    map[string]*exec.Cmd // Store audio processes
 	stdins       map[string]io.WriteCloser
 	mu           sync.Mutex
 }
@@ -25,6 +26,7 @@ func NewFFmpegRecorder(recordingDir string) ports.MediaRecorder {
 	return &ffmpegRecorder{
 		recordingDir: recordingDir,
 		cmds:         make(map[string]*exec.Cmd),
+		audioCmds:    make(map[string]*exec.Cmd),
 		stdins:       make(map[string]io.WriteCloser),
 	}
 }
@@ -33,11 +35,7 @@ func (f *ffmpegRecorder) Start(ctx context.Context, sessionId string, videoStrea
 	filename := fmt.Sprintf("meeting-%s-%d.mp4", sessionId, time.Now().Unix())
 	path := filepath.Join(f.recordingDir, filename)
 
-	// UPDATED STRATEGY for robust cross-platform:
-	// We will spawn a goroutine to copy videoStream -> stdin.
-	// We will spawn a goroutine to copy audioStream -> separate file (meeting-audio.wav) for now.
-
-	// 1. Video Recording
+	// 1. Video Recording (From Pipe)
 	videoCmd := exec.Command("ffmpeg",
 		"-y",
 		"-f", "image2pipe", "-vcodec", "png", "-r", "5", "-i", "-",
@@ -50,15 +48,29 @@ func (f *ffmpegRecorder) Start(ctx context.Context, sessionId string, videoStrea
 		return err
 	}
 
-	// 2. Audio Recording (Separate File)
-	audioPath := filepath.Join(f.recordingDir, fmt.Sprintf("meeting-%s-audio.wav", sessionId))
-	audioFile, err := os.Create(audioPath)
-	if err != nil {
-		return err
+	// 2. Audio Recording (PulseAudio System Capture)
+	// Records from default output (what the bot "hears")
+	audioFilename := fmt.Sprintf("meeting-%s-audio.wav", sessionId)
+	audioPath := filepath.Join(f.recordingDir, audioFilename)
+	
+	audioCmd := exec.Command("ffmpeg",
+		"-y",
+		"-f", "pulse", "-i", "default",
+		"-ac", "2",
+		audioPath,
+	)
+
+	// Start Audio Process
+	if err := audioCmd.Start(); err != nil {
+		fmt.Printf("[FFmpeg] Failed to start audio recording: %v\n", err)
+		// Proceed with video only if audio fails
+	} else {
+		fmt.Printf("[FFmpeg] Started audio recording: %s\n", audioPath)
 	}
 
 	f.mu.Lock()
 	f.cmds[sessionId] = videoCmd
+	f.audioCmds[sessionId] = audioCmd
 	f.stdins[sessionId] = videoStdin
 	f.mu.Unlock()
 
@@ -66,27 +78,26 @@ func (f *ffmpegRecorder) Start(ctx context.Context, sessionId string, videoStrea
 		return err
 	}
 
-	fmt.Printf("[FFmpeg] Started recording session %s\n - Video: %s\n - Audio: %s\n", sessionId, path, audioPath)
+	fmt.Printf("[FFmpeg] Started video recording session %s to %s\n", sessionId, path)
 
 	// Pump Video
-	go func() {
-		defer videoStdin.Close()
-		io.Copy(videoStdin, videoStream)
-	}()
-
-	// Pump Audio
-	go func() {
-		defer audioFile.Close()
-		io.Copy(audioFile, audioStream)
-	}()
+	if videoStream != nil {
+		go func() {
+			defer videoStdin.Close()
+			io.Copy(videoStdin, videoStream)
+		}()
+	} else {
+		videoStdin.Close()
+	}
 
 	return nil
 }
 
 func (f *ffmpegRecorder) Stop(ctx context.Context, sessionId string) (string, error) {
 	f.mu.Lock()
-	cmd, ok := f.cmds[sessionId]
-	stdin := f.stdins[sessionId] // Retrieve stdin to ensure it's closed
+	videoCmd, ok := f.cmds[sessionId]
+	audioCmd := f.audioCmds[sessionId]
+	stdin := f.stdins[sessionId]
 	f.mu.Unlock()
 
 	if !ok {
@@ -95,26 +106,35 @@ func (f *ffmpegRecorder) Stop(ctx context.Context, sessionId string) (string, er
 
 	fmt.Printf("[FFmpeg] Stopping recording for session %s\n", sessionId)
 
-	// Close stdin to signal EOF to FFmpeg.
-	// The goroutine in Start() is responsible for closing stdin when `frames` channel closes.
-	// If Stop is called before `frames` channel closes, we explicitly close it here.
-	// This will cause the goroutine to exit.
+	// Stop Video: Close stdin to signal EOF
 	if stdin != nil {
 		stdin.Close()
 	}
+	// Wait for video finish
+	err := videoCmd.Wait()
 
-	// Wait for FFmpeg to finish
-	err := cmd.Wait()
+	// Stop Audio: Process must be killed (SIGTERM)
+	if audioCmd != nil && audioCmd.Process != nil {
+		fmt.Println("[FFmpeg] Stopping audio process...")
+		_ = audioCmd.Process.Signal(os.Interrupt)
+		// Give it a moment to finalize file headers
+		done := make(chan error)
+		go func() { done <- audioCmd.Wait() }()
+		
+		select {
+		case <-done:
+			// Process exited clean-ish
+		case <-time.After(2 * time.Second):
+			// Force kill if stuck
+			_ = audioCmd.Process.Kill()
+		}
+	}
 
 	f.mu.Lock()
 	delete(f.cmds, sessionId)
+	delete(f.audioCmds, sessionId)
 	delete(f.stdins, sessionId)
 	f.mu.Unlock()
 
-	// Return the path (we should ideally track the path in the struct to be safe)
-	// For now, we'll return a placeholder and the error from cmd.Wait()
-	// The actual path is constructed in Start, but not stored.
-	// A more robust solution would store the `path` in the `ffmpegRecorder` struct
-	// associated with the sessionId.
 	return "check recordings directory", err
 }
